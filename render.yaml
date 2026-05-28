@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: jagmychef-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER
+        sync: false
+      - key: USER_WHATSAPP_NUMBER
+        sync: false
+      - key: SUMEGHA_WHATSAPP_NUMBER
+        sync: false
