@@ -154,7 +154,7 @@ def ask_claude(state, user_message, sender_name):
     })
 
     response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5",
         max_tokens=1000,
         system=build_system_prompt(state),
         messages=history
