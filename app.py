@@ -8,33 +8,32 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
 
-# ── Clients ────────────────────────────────────────────────────────────────────
+# ── Clients ─────────────────────────────────────────────────────────────────
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 twilio_client = Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
 
-TWILIO_NUMBER   = os.environ["TWILIO_WHATSAPP_NUMBER"]   # e.g. whatsapp:+14155238886
-USER_NUMBER     = os.environ["USER_WHATSAPP_NUMBER"]      # e.g. whatsapp:+12065551234
-SUMEGHA_NUMBER  = os.environ["SUMEGHA_WHATSAPP_NUMBER"]   # e.g. whatsapp:+12065555678
+TWILIO_NUMBER   = os.environ["TWILIO_WHATSAPP_NUMBER"]   # whatsapp:+14155238886
+USER_NUMBER     = os.environ["USER_WHATSAPP_NUMBER"]      # whatsapp:+1XXXXXXXXXX
+SUMEGHA_NUMBER  = os.environ["SUMEGHA_WHATSAPP_NUMBER"]   # whatsapp:+1XXXXXXXXXX
 
-# ── Persistent state files ─────────────────────────────────────────────────────
-BASE_DIR        = os.path.dirname(__file__)
-MENU_FILE       = os.path.join(BASE_DIR, "data", "menu.json")
-STATE_FILE      = os.path.join(BASE_DIR, "data", "state.json")
+# ── Persistent state files ───────────────────────────────────────────────────
+BASE_DIR   = os.path.dirname(__file__)
+MENU_FILE  = os.path.join(BASE_DIR, "data", "menu.json")
+STATE_FILE = os.path.join(BASE_DIR, "data", "state.json")
 
 os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
 
-# ── Load menu ──────────────────────────────────────────────────────────────────
 with open(MENU_FILE) as f:
     MENU = json.load(f)
 
-# ── State helpers ──────────────────────────────────────────────────────────────
+# ── State helpers ────────────────────────────────────────────────────────────
 DEFAULT_STATE = {
     "rules": {
         "slots": [
-            {"label": "Chicken dish",      "category": "Indian",  "filter": "chicken"},
-            {"label": "Salad",             "category": "Salads",  "filter": "any"},
-            {"label": "Vegetarian dish",   "category": "Indian",  "filter": "vegetarian"},
-            {"label": "Vegetarian dish",   "category": "Indian",  "filter": "vegetarian"},
+            {"label": "Chicken dish",    "category": "Indian", "filter": "chicken"},
+            {"label": "Salad",           "category": "Salads", "filter": "any"},
+            {"label": "Veg dish",        "category": "Indian", "filter": "vegetarian"},
+            {"label": "Veg dish",        "category": "Indian", "filter": "vegetarian"},
         ],
         "no_repeat_weeks": 2,
         "rule_overrides_this_week": []
@@ -56,7 +55,6 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-# ── Recent items (no-repeat logic) ─────────────────────────────────────────────
 def get_recent_items(state):
     no_repeat = state["rules"].get("no_repeat_weeks", 2)
     recent = []
@@ -64,7 +62,6 @@ def get_recent_items(state):
         recent.extend(entry.get("picks", []))
     return recent
 
-# ── All items flat list ────────────────────────────────────────────────────────
 def all_items_flat():
     items = []
     for category, dishes in MENU["repository"].items():
@@ -72,15 +69,26 @@ def all_items_flat():
             items.append({"name": dish, "category": category})
     return items
 
-# ── System prompt for Claude ───────────────────────────────────────────────────
+# ── Frequency map from history ───────────────────────────────────────────────
+def build_frequency_summary(state):
+    freq = {}
+    for entry in state.get("selection_history", []):
+        for pick in entry.get("picks", []):
+            freq[pick] = freq.get(pick, 0) + 1
+    if not freq:
+        return "No history yet."
+    sorted_items = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    lines = [f"  {dish} — selected {count}x" for dish, count in sorted_items[:20]]
+    return "\n".join(lines)
+
+# ── System prompt ────────────────────────────────────────────────────────────
 def build_system_prompt(state):
     recent = get_recent_items(state)
-    all_items = all_items_flat()
-    rules = state["rules"]
+    rules  = state["rules"]
 
     slots_desc = "\n".join(
-        f"  Slot {i+1}: {s['label']} — pick from category '{s['category']}'"
-        + (f" matching filter '{s['filter']}'" if s["filter"] != "any" else "")
+        f"  Slot {i+1}: {s['label']} — category '{s['category']}'"
+        + (f", filter '{s['filter']}'" if s["filter"] != "any" else "")
         for i, s in enumerate(rules["slots"])
     )
 
@@ -89,13 +97,14 @@ def build_system_prompt(state):
         for i, p in enumerate(state["current_picks"])
     )
 
-    recent_desc = "\n".join(f"  - {r}" for r in recent) if recent else "  None"
+    recent_desc   = "\n".join(f"  - {r}" for r in recent) if recent else "  None"
+    freq_summary  = build_frequency_summary(state)
 
-    return f"""You are the Chef Jag meal selection assistant for a WhatsApp group.
-Every Thursday you suggest 4 dishes from Chef Jag's menu for Monday cooking.
-You are helpful, warm, concise — this is a casual WhatsApp conversation, keep replies short.
+    return f"""You are the Chef Jag meal selection assistant for a WhatsApp group chat.
+Every Thursday you help two people (the user and Sumegha) pick 4 dishes for Chef Jag to cook on Monday.
+This is a casual WhatsApp conversation — be warm, concise, friendly.
 
-=== FULL MENU (JSON) ===
+=== FULL MENU ===
 {json.dumps(MENU["repository"], indent=2)}
 
 === CURRENT SELECTION RULES ===
@@ -105,53 +114,83 @@ No-repeat window: {rules['no_repeat_weeks']} weeks
 === CURRENT PICKS THIS WEEK ===
 {current_picks_desc}
 
-=== DO NOT REPEAT THESE (used in last {rules['no_repeat_weeks']} weeks) ===
+=== DO NOT REPEAT (last {rules['no_repeat_weeks']} weeks) ===
 {recent_desc}
 
+=== SELECTION FREQUENCY (most picked = likely favourites) ===
+{freq_summary}
+
 === YOUR CAPABILITIES ===
-1. SUGGEST: Generate initial 4 picks following the slot rules and no-repeat window.
-2. SMART SWAP: When a user requests a specific dish or style (e.g. "I want a kebab", 
-   "suggest a salad with cucumber", "something lighter"), use culinary reasoning to find 
-   the best match from the menu. Always pick from the correct slot's category unless the 
-   user explicitly asks to break a rule.
-3. RULE CHANGES: Detect when a user wants to change rules. Examples:
-   - "change to 2 chicken dishes" → update slot structure
-   - "no Indian this week" → override category for this week only
-   - "from now on add a soup" → permanent rule change
-   - "Sumegha is vegetarian today" → note it, adjust if needed
-   When rules change, confirm what changed and re-suggest affected slots.
-4. CONFIRM: When both users seem happy (e.g. "looks good", "perfect", "confirmed", 
-   "let's go"), output a JSON block at the END of your message in this exact format:
+
+1. INITIAL 8 SUGGESTIONS (Thursday trigger):
+   Present 8 options — double for each slot — so they can choose 4 with less back-and-forth.
+   Format as pairs, labeled A through H:
+   
+   🍗 *Chicken* (pick 1):
+   A. [dish] — [one-line reason]
+   B. [dish] — [one-line reason]
+   
+   🥗 *Salad* (pick 1):
+   C. [dish] — [one-line reason]
+   D. [dish] — [one-line reason]
+   
+   🌿 *Veg dish* (pick 1):
+   E. [dish] — [one-line reason]
+   F. [dish] — [one-line reason]
+   
+   🌿 *Veg dish* (pick 1):
+   G. [dish] — [one-line reason]
+   H. [dish] — [one-line reason]
+   
+   End with: "Reply with 4 letters (e.g. A, C, E, G) or ask for swaps!"
+   Use frequency data to favour dishes they haven't had recently or love.
+
+2. LETTER SELECTION: When they reply with letters (e.g. "A C F H" or "A, C, F, H"):
+   Map the letters to the dishes and confirm the 4 picks clearly.
+   Ask "Happy with these? Reply *confirm* to lock them in!"
+
+3. SMART SWAP: For specific requests ("I want a kebab", "something with paneer", 
+   "lighter salad", "salad with cucumber") — use culinary reasoning to find the 
+   best menu match. For ingredients not in dish names, say "likely contains".
+
+4. ECHO SENDER: Start every response (except the initial Thursday message) with:
+   [You]: or [Sumegha]: — whoever sent the last message — so both people 
+   know who triggered what.
+
+5. RULE CHANGES: Detect rule change requests:
+   - "change to 2 chicken dishes" → update slots
+   - "no Indian this week" → this-week override
+   - "from now on include a soup" → permanent change
+   - "Sumegha is vegetarian this week" → note and adjust
+   Confirm what changed, then re-suggest affected slots.
+   Emit at end of message:
+   <<<RULE_CHANGE>>>
+   {{"type": "this_week" or "permanent", "description": "...", "new_slots": [...] or null}}
+   <<<END>>>
+
+6. CONFIRMATION: When they say "confirm", "looks good", "perfect", "lock it in":
+   Output a summary and emit at end:
    <<<CONFIRMED>>>
    {{"picks": ["dish1", "dish2", "dish3", "dish4"]}}
    <<<END>>>
-5. INGREDIENT REASONING: If asked for a dish with specific ingredients (cucumber, 
-   pomegranate, etc.), reason from culinary knowledge about which menu dishes likely 
-   contain them. Be honest if you're inferring — say "likely contains" not "definitely has".
+
+7. USE HISTORY INTELLIGENTLY:
+   - Favour dishes they pick frequently (from frequency data above) but respect no-repeat window
+   - If a dish has never been picked, flag it as "haven't tried this yet!"
+   - Avoid dishes marked disliked in preferences
 
 === RESPONSE STYLE ===
-- WhatsApp style: short, friendly, no markdown headers
-- Use numbered lists for the 4 dishes
-- Add a one-line reason for each pick (e.g. "— light and seasonal")
-- For swaps, just show the new dish and say what it replaces
-- Emoji are fine but don't overdo it
-- Max ~200 words per message
-
-=== RULE CHANGE RESPONSE FORMAT ===
-When you detect a rule change request, respond with a JSON block at END of message:
-<<<RULE_CHANGE>>>
-{{"type": "this_week" or "permanent", "change_description": "...", "new_slots": [...] or null}}
-<<<END>>>
+- WhatsApp style: short, warm, no markdown headers (use *bold* for WhatsApp bold)
+- Initial suggestions: use the A-H pair format above
+- Swaps: just show new dish + what it replaces
+- Confirmations: clean numbered list of final 4
+- Max ~300 words for initial, ~120 for swaps/replies
 """
 
-# ── Claude call ────────────────────────────────────────────────────────────────
+# ── Claude call ──────────────────────────────────────────────────────────────
 def ask_claude(state, user_message, sender_name):
     history = state.get("conversation_history", [])
-
-    history.append({
-        "role": "user",
-        "content": f"[{sender_name}]: {user_message}"
-    })
+    history.append({"role": "user", "content": f"[{sender_name}]: {user_message}"})
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-5",
@@ -161,46 +200,38 @@ def ask_claude(state, user_message, sender_name):
     )
 
     reply_text = response.content[0].text
-
-    history.append({
-        "role": "assistant",
-        "content": reply_text
-    })
-
-    state["conversation_history"] = history[-30:]  # keep last 30 turns
+    history.append({"role": "assistant", "content": reply_text})
+    state["conversation_history"] = history[-30:]
     return reply_text
 
-# ── Parse Claude response for special blocks ───────────────────────────────────
+# ── Parse Claude response ────────────────────────────────────────────────────
 def parse_reply(reply, state):
     clean_reply = reply
 
-    # Check for confirmation
     if "<<<CONFIRMED>>>" in reply:
         try:
             block = reply.split("<<<CONFIRMED>>>")[1].split("<<<END>>>")[0].strip()
-            data = json.loads(block)
+            data  = json.loads(block)
             picks = data.get("picks", [])
             if len(picks) == 4:
                 state["current_picks"] = picks
-                state["confirmed"] = True
-                week_str = date.today().isoformat()
+                state["confirmed"]     = True
+                week_str               = date.today().isoformat()
                 state["selection_history"].append({
-                    "week": week_str,
-                    "picks": picks,
+                    "week":     week_str,
+                    "picks":    picks,
                     "feedback": []
                 })
-                # Reset for next week
                 state["conversation_history"] = []
                 state["week"] = week_str
         except Exception as e:
             print(f"Confirmation parse error: {e}")
         clean_reply = reply.split("<<<CONFIRMED>>>")[0].strip()
 
-    # Check for rule change
     if "<<<RULE_CHANGE>>>" in reply:
         try:
             block = reply.split("<<<RULE_CHANGE>>>")[1].split("<<<END>>>")[0].strip()
-            data = json.loads(block)
+            data  = json.loads(block)
             if data.get("new_slots"):
                 if data.get("type") == "permanent":
                     state["rules"]["slots"] = data["new_slots"]
@@ -212,7 +243,7 @@ def parse_reply(reply, state):
 
     return clean_reply, state
 
-# ── Send to both numbers ───────────────────────────────────────────────────────
+# ── Twilio send ──────────────────────────────────────────────────────────────
 def send_whatsapp(message, to_number):
     twilio_client.messages.create(
         from_=TWILIO_NUMBER,
@@ -224,66 +255,87 @@ def broadcast(message):
     send_whatsapp(message, USER_NUMBER)
     send_whatsapp(message, SUMEGHA_NUMBER)
 
-# ── Thursday trigger ───────────────────────────────────────────────────────────
+# ── Thursday trigger ─────────────────────────────────────────────────────────
 @app.route("/trigger", methods=["GET", "POST"])
 def thursday_trigger():
     state = load_state()
-
-    # Reset picks for new week
-    state["current_picks"] = [None, None, None, None]
-    state["confirmed"] = False
+    state["current_picks"]   = [None, None, None, None]
+    state["confirmed"]       = False
     state["conversation_history"] = []
-    state["week"] = date.today().isoformat()
+    state["week"]            = date.today().isoformat()
 
-    # Apply any week-level overrides back to main slots if needed
     if state["rules"].get("rule_overrides_this_week"):
         state["rules"]["slots"] = state["rules"]["rule_overrides_this_week"]
         state["rules"]["rule_overrides_this_week"] = []
 
-    # Ask Claude for initial suggestions
-    today = datetime.now().strftime("%A, %B %d")
-    initial_message = f"It's Thursday {today}. Please suggest this week's 4 dishes following the current rules."
+    today   = datetime.now().strftime("%A, %B %d")
+    prompt  = (
+        f"It's Thursday {today}. Generate the initial 8 suggestions "
+        f"(2 per slot, A-H format) following current rules and history."
+    )
 
-    reply = ask_claude(state, initial_message, "System")
+    reply = ask_claude(state, prompt, "System")
     clean_reply, state = parse_reply(reply, state)
 
     save_state(state)
     broadcast(clean_reply)
-
     return "OK", 200
 
-# ── Incoming WhatsApp message ──────────────────────────────────────────────────
+# ── Incoming WhatsApp ────────────────────────────────────────────────────────
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_incoming():
     from_number = request.form.get("From", "")
-    body = request.form.get("Body", "").strip()
+    body        = request.form.get("Body", "").strip()
 
-    # Identify sender
     if from_number == USER_NUMBER:
         sender_name = "You"
     elif from_number == SUMEGHA_NUMBER:
         sender_name = "Sumegha"
     else:
-        return str(MessagingResponse()), 200  # ignore unknown numbers
+        return str(MessagingResponse()), 200
 
     state = load_state()
-
-    # Get Claude's response
     reply = ask_claude(state, body, sender_name)
     clean_reply, state = parse_reply(reply, state)
 
     save_state(state)
-
-    # Send reply to BOTH people (so both see the response)
     broadcast(clean_reply)
-
-    # Return empty TwiML (we already sent manually)
     return str(MessagingResponse()), 200
 
-# ── Health check ───────────────────────────────────────────────────────────────
+# ── Seed history from email data ─────────────────────────────────────────────
+@app.route("/seed_history", methods=["POST"])
+def seed_history():
+    """
+    POST JSON: {"history": [{"week": "2026-01-09", "picks": ["dish1","dish2","dish3","dish4"]}, ...]}
+    Used to bootstrap selection history from past Grocery Genie emails.
+    """
+    data  = request.get_json()
+    state = load_state()
+    new_entries = data.get("history", [])
+    existing_weeks = {e["week"] for e in state["selection_history"]}
+    added = 0
+    for entry in new_entries:
+        if entry["week"] not in existing_weeks:
+            state["selection_history"].append({
+                "week":     entry["week"],
+                "picks":    entry["picks"],
+                "feedback": entry.get("feedback", [])
+            })
+            added += 1
+    state["selection_history"].sort(key=lambda x: x["week"])
+    save_state(state)
+    return {"seeded": added, "total": len(state["selection_history"])}, 200
+
+# ── Health check ─────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return {"status": "ok", "date": date.today().isoformat()}, 200
+    state = load_state()
+    return {
+        "status":  "ok",
+        "date":    date.today().isoformat(),
+        "history": len(state.get("selection_history", [])),
+        "confirmed_this_week": state.get("confirmed", False)
+    }, 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
