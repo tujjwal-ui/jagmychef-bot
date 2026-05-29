@@ -16,10 +16,24 @@ TWILIO_NUMBER  = os.environ["TWILIO_WHATSAPP_NUMBER"]
 USER_NUMBER    = os.environ["USER_WHATSAPP_NUMBER"]
 SUMEGHA_NUMBER = os.environ["SUMEGHA_WHATSAPP_NUMBER"]
 
+# ── Redis (Upstash) ──────────────────────────────────────────────────────────
+REDIS_URL = os.environ.get("UPSTASH_REDIS_URL", "")
+redis_client = None
+if REDIS_URL:
+    try:
+        import redis
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        print("Redis connected OK")
+    except Exception as e:
+        print(f"Redis connection failed, using file fallback: {e}")
+        redis_client = None
+
+STATE_KEY = "jagmychef:state"
+
 # ── Menu ─────────────────────────────────────────────────────────────────────
 BASE_DIR  = os.path.dirname(__file__)
 MENU_FILE = os.path.join(BASE_DIR, "data", "menu.json")
-STATE_FILE = os.path.join(BASE_DIR, "data", "state.json")
 os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
 
 with open(MENU_FILE) as f:
@@ -43,25 +57,52 @@ DEFAULT_STATE = {
     "confirmed": False,
     "week": None,
     "feedback_mode": False,
-    "dish_scores": {},       # dish -> {"likes": N, "dislikes": N}
-    "rejected_this_week": [] # dishes swapped out during Thursday chat
+    "dish_scores": {},
+    "rejected_this_week": []
 }
 
-# ── State helpers ─────────────────────────────────────────────────────────────
+# ── State helpers (Redis-backed, file fallback) ───────────────────────────────
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
+    # Try Redis first
+    if redis_client:
+        try:
+            raw = redis_client.get(STATE_KEY)
+            if raw:
+                s = json.loads(raw)
+                for k, v in DEFAULT_STATE.items():
+                    if k not in s:
+                        s[k] = v
+                return s
+        except Exception as e:
+            print(f"Redis read error: {e}")
+
+    # File fallback
+    fpath = os.path.join(BASE_DIR, "data", "state.json")
+    if os.path.exists(fpath):
+        with open(fpath) as f:
             s = json.load(f)
-            # backfill new keys
             for k, v in DEFAULT_STATE.items():
                 if k not in s:
                     s[k] = v
             return s
+
     return DEFAULT_STATE.copy()
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    # Save to Redis
+    if redis_client:
+        try:
+            redis_client.set(STATE_KEY, json.dumps(state))
+        except Exception as e:
+            print(f"Redis write error: {e}")
+
+    # Always write file backup too
+    fpath = os.path.join(BASE_DIR, "data", "state.json")
+    try:
+        with open(fpath, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"File write error: {e}")
 
 # ── Scoring helpers ───────────────────────────────────────────────────────────
 def get_recent_items(state):
@@ -72,51 +113,47 @@ def get_recent_items(state):
     return recent
 
 def build_frequency_summary(state):
-    """Frequency + like/dislike scores combined into a ranked list."""
     freq = {}
     for entry in state.get("selection_history", []):
         for pick in entry.get("picks", []):
             freq[pick] = freq.get(pick, 0) + 1
 
-    scores = state.get("dish_scores", {})
+    scores   = state.get("dish_scores", {})
     rejected = state.get("rejected_this_week", [])
 
     lines = []
     all_dishes = set(list(freq.keys()) + list(scores.keys()))
     for dish in all_dishes:
-        count = freq.get(dish, 0)
-        likes = scores.get(dish, {}).get("likes", 0)
+        count    = freq.get(dish, 0)
+        likes    = scores.get(dish, {}).get("likes", 0)
         dislikes = scores.get(dish, {}).get("dislikes", 0)
-        rej = "⚠️ swapped out recently" if dish in rejected else ""
-        net = likes - dislikes
+        net      = likes - dislikes
+        rej_flag = " ⚠️ swapped out recently" if dish in rejected else ""
         tag = ""
-        if net >= 2: tag = "⭐ highly rated"
-        elif net == 1: tag = "👍 liked"
-        elif net <= -1: tag = "👎 disliked — avoid unless requested"
-        lines.append(f"  {dish} — ordered {count}x, net score {net:+d} {tag} {rej}".strip())
+        if net >= 2:  tag = " ⭐ highly rated"
+        elif net == 1: tag = " 👍 liked"
+        elif net <= -1: tag = " 👎 disliked — avoid unless requested"
+        lines.append(f"  {dish} — ordered {count}x, net score {net:+d}{tag}{rej_flag}")
 
     lines.sort(key=lambda x: ("avoid" not in x, "highly" in x, "liked" in x), reverse=True)
     return "\n".join(lines[:30]) if lines else "No history yet."
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 def build_system_prompt(state):
-    recent = get_recent_items(state)
-    rules  = state["rules"]
-
-    slots_desc = "\n".join(
+    recent       = get_recent_items(state)
+    rules        = state["rules"]
+    slots_desc   = "\n".join(
         f"  Slot {i+1}: {s['label']} — category '{s['category']}'"
         + (f", filter '{s['filter']}'" if s["filter"] != "any" else "")
         for i, s in enumerate(rules["slots"])
     )
-
-    current_picks_desc = "\n".join(
+    picks_desc   = "\n".join(
         f"  Slot {i+1} ({rules['slots'][i]['label']}): {p or 'EMPTY'}"
         for i, p in enumerate(state["current_picks"])
     )
-
-    recent_desc     = "\n".join(f"  - {r}" for r in recent) if recent else "  None"
-    freq_summary    = build_frequency_summary(state)
-    rejected_desc   = "\n".join(f"  - {r}" for r in state.get("rejected_this_week", [])) or "  None"
+    recent_desc  = "\n".join(f"  - {r}" for r in recent) if recent else "  None"
+    freq_summary = build_frequency_summary(state)
+    rejected_desc = "\n".join(f"  - {r}" for r in state.get("rejected_this_week", [])) or "  None"
 
     return f"""You are the Chef Jag meal selection assistant for a WhatsApp group chat.
 Every Thursday you help Tushar and Sumegha pick 4 dishes for Chef Jag to cook on Monday.
@@ -130,32 +167,31 @@ This is a casual WhatsApp conversation — be warm, concise, friendly.
 No-repeat window: {rules['no_repeat_weeks']} weeks
 
 === CURRENT PICKS THIS WEEK ===
-{current_picks_desc}
+{picks_desc}
 
 === DO NOT REPEAT (last {rules['no_repeat_weeks']} weeks) ===
 {recent_desc}
 
-=== DISH SCORES & HISTORY (use to rank suggestions) ===
+=== DISH SCORES & HISTORY ===
 {freq_summary}
 
-=== DISHES SWAPPED OUT THIS THURSDAY (soft dislike signal) ===
+=== DISHES SWAPPED OUT THIS THURSDAY ===
 {rejected_desc}
 
 === RECOMMENDATION ALGORITHM ===
-When generating suggestions, rank candidates using these weighted signals:
-
+Rank candidates using these signals in order:
 1. HARD BLOCK: never suggest dishes in the no-repeat list
 2. HARD BLOCK: never suggest dishes with net score <= -2 unless explicitly requested
-3. PREFER: dishes with net score >= 2 (highly rated) — suggest these first unless recently repeated
-4. PREFER: dishes ordered 2-3x (proven favourites) over untried dishes
-5. NOVELTY: if all favourite slots are blocked by no-repeat, flag new dishes with "haven't tried this yet!"
-6. AVOID: dishes swapped out this Thursday (rejected_this_week) — treat as soft dislike for 2 weeks
-7. BALANCE: within slot constraints, aim for variety (avoid clustering similar flavour profiles)
+3. PREFER: net score >= 2 (highly rated) — suggest these first
+4. PREFER: ordered 2-3x (proven favourites) over untried dishes
+5. NOVELTY: flag untried dishes with "haven't tried this yet!"
+6. AVOID: dishes in rejected_this_week — treat as soft dislike for 2 weeks
+7. BALANCE: vary flavour profiles within slots
 
-=== YOUR CAPABILITIES ===
+=== CAPABILITIES ===
 
 1. INITIAL 8 SUGGESTIONS (Thursday trigger):
-   Present 8 options — 2 per slot — labeled A through H:
+   Present 8 options — 2 per slot — labeled A-H:
 
    🍗 *Chicken* (pick 1):
    A. [dish] — [one-line reason]
@@ -175,46 +211,38 @@ When generating suggestions, rank candidates using these weighted signals:
 
    End with: "Reply with 4 letters (e.g. A, C, E, G) or ask for swaps!"
 
-2. LETTER SELECTION: When they reply with 4 letters (e.g. "A C F H"):
-   Map letters to dishes and confirm the 4 picks clearly.
+2. LETTER SELECTION: Map letters to dishes, confirm clearly.
    Ask: "Happy with these? Reply *confirm* to lock them in!"
 
-3. SMART SWAP: For natural requests ("I want a kebab", "something lighter",
-   "salad with cucumber") — use culinary reasoning to find the best menu match.
-   When a dish is swapped out, note it internally as a rejection signal.
-   Emit at end of swap response:
+3. SMART SWAP: Match natural requests to menu using culinary reasoning.
+   When a dish is swapped out, emit at end of reply:
    <<<REJECTED>>>
    {{"dish": "name of dish being replaced"}}
    <<<END>>>
 
-4. ECHO SENDER: Start EVERY response (except the initial Thursday message) with
-   *[Tushar]:* or *[Sumegha]:* — whoever sent the last message.
+4. ECHO SENDER: Start every reply (except Thursday opener) with *[Tushar]:* or *[Sumegha]:*
 
-5. RULE CHANGES: Detect rule change requests and confirm what changed.
-   Emit at end of message:
+5. RULE CHANGES: Detect and confirm rule changes. Emit:
    <<<RULE_CHANGE>>>
    {{"type": "this_week" or "permanent", "description": "...", "new_slots": [...] or null}}
    <<<END>>>
 
-6. CONFIRMATION: When they say "confirm", "looks good", "perfect", "lock it in":
-   Show a clean summary of the final 4, then emit:
+6. CONFIRMATION: On "confirm" / "looks good" / "lock it in", emit:
    <<<CONFIRMED>>>
    {{"picks": ["dish1", "dish2", "dish3", "dish4"]}}
    <<<END>>>
 
-7. FEEDBACK MODE (Tuesday evening):
-   When you receive a feedback prompt, ask them to rate each dish with 👍 or 👎.
-   Format your ask clearly showing each dish numbered.
-   When they reply with ratings, parse them and emit:
+7. FEEDBACK MODE (Tuesday): Ask them to rate each dish 👍 or 👎, numbered.
+   When ratings arrive, parse and emit:
    <<<FEEDBACK>>>
    {{"ratings": {{"dish_name": "like" or "dislike", ...}}}}
    <<<END>>>
-   Then thank them warmly and mention what you learned.
+   Then thank them and mention what you learned for next week.
 
 === STYLE ===
-- WhatsApp: short, warm, use *bold* for WhatsApp formatting
-- Initial suggestions: A-H pair format
-- Swaps: just show new dish + what it replaces
+- WhatsApp style, *bold* for emphasis
+- Initial: A-H pair format
+- Swaps: new dish + what it replaces
 - Max ~300 words initial, ~120 for replies
 """
 
@@ -237,67 +265,59 @@ def ask_claude(state, user_message, sender_name):
 
 # ── Parse Claude response ────────────────────────────────────────────────────
 def parse_reply(reply, state):
-    clean_reply = reply
+    clean = reply
 
-    # Confirmation
     if "<<<CONFIRMED>>>" in reply:
         try:
             block = reply.split("<<<CONFIRMED>>>")[1].split("<<<END>>>")[0].strip()
-            data  = json.loads(block)
-            picks = data.get("picks", [])
+            picks = json.loads(block).get("picks", [])
             if len(picks) == 4:
-                state["current_picks"] = picks
-                state["confirmed"]     = True
-                week_str               = date.today().isoformat()
+                state["current_picks"]  = picks
+                state["confirmed"]      = True
                 state["selection_history"].append({
-                    "week": week_str, "picks": picks,
+                    "week":     date.today().isoformat(),
+                    "picks":    picks,
                     "rejected": list(state.get("rejected_this_week", [])),
                     "feedback": {}
                 })
                 state["conversation_history"] = []
-                state["week"] = week_str
+                state["week"]               = date.today().isoformat()
                 state["rejected_this_week"] = []
-                state["feedback_mode"] = False
+                state["feedback_mode"]      = False
         except Exception as e:
-            print(f"Confirmation parse error: {e}")
-        clean_reply = reply.split("<<<CONFIRMED>>>")[0].strip()
+            print(f"Confirmed parse error: {e}")
+        clean = reply.split("<<<CONFIRMED>>>")[0].strip()
 
-    # Rejection tracking
     if "<<<REJECTED>>>" in reply:
         try:
             block = reply.split("<<<REJECTED>>>")[1].split("<<<END>>>")[0].strip()
-            data  = json.loads(block)
-            dish  = data.get("dish", "")
+            dish  = json.loads(block).get("dish", "")
             if dish and dish not in state.get("rejected_this_week", []):
                 state.setdefault("rejected_this_week", []).append(dish)
         except Exception as e:
-            print(f"Rejection parse error: {e}")
-        clean_reply = clean_reply.replace(
-            reply[reply.find("<<<REJECTED>>>"):reply.find("<<<END>>>", reply.find("<<<REJECTED>>>"))+9], ""
-        ).strip()
+            print(f"Rejected parse error: {e}")
+        # strip the block from clean
+        if "<<<REJECTED>>>" in clean:
+            start = clean.find("<<<REJECTED>>>")
+            end   = clean.find("<<<END>>>", start) + 9
+            clean = (clean[:start] + clean[end:]).strip()
 
-    # Feedback
     if "<<<FEEDBACK>>>" in reply:
         try:
             block   = reply.split("<<<FEEDBACK>>>")[1].split("<<<END>>>")[0].strip()
-            data    = json.loads(block)
-            ratings = data.get("ratings", {})
+            ratings = json.loads(block).get("ratings", {})
             scores  = state.setdefault("dish_scores", {})
             for dish, rating in ratings.items():
                 entry = scores.setdefault(dish, {"likes": 0, "dislikes": 0})
-                if rating == "like":
-                    entry["likes"] += 1
-                elif rating == "dislike":
-                    entry["dislikes"] += 1
-            # also store on most recent history entry
+                if rating == "like":    entry["likes"]    += 1
+                elif rating == "dislike": entry["dislikes"] += 1
             if state["selection_history"]:
                 state["selection_history"][-1]["feedback"] = ratings
             state["feedback_mode"] = False
         except Exception as e:
             print(f"Feedback parse error: {e}")
-        clean_reply = reply.split("<<<FEEDBACK>>>")[0].strip()
+        clean = reply.split("<<<FEEDBACK>>>")[0].strip()
 
-    # Rule change
     if "<<<RULE_CHANGE>>>" in reply:
         try:
             block = reply.split("<<<RULE_CHANGE>>>")[1].split("<<<END>>>")[0].strip()
@@ -309,9 +329,9 @@ def parse_reply(reply, state):
                     state["rules"]["rule_overrides_this_week"] = data["new_slots"]
         except Exception as e:
             print(f"Rule change parse error: {e}")
-        clean_reply = reply.split("<<<RULE_CHANGE>>>")[0].strip()
+        clean = reply.split("<<<RULE_CHANGE>>>")[0].strip()
 
-    return clean_reply, state
+    return clean, state
 
 # ── Twilio helpers ───────────────────────────────────────────────────────────
 def send_whatsapp(message, to_number):
@@ -341,11 +361,10 @@ def thursday_trigger():
         f"It's Thursday {today}. Generate the initial 8 suggestions "
         f"(2 per slot, A-H format) using the scoring algorithm."
     )
-
     reply = ask_claude(state, prompt, "System")
-    clean_reply, state = parse_reply(reply, state)
+    clean, state = parse_reply(reply, state)
     save_state(state)
-    broadcast(clean_reply)
+    broadcast(clean)
     return "OK", 200
 
 # ── Tuesday feedback trigger ─────────────────────────────────────────────────
@@ -353,23 +372,22 @@ def thursday_trigger():
 def feedback_trigger():
     state = load_state()
 
-    if not state.get("confirmed") or not state.get("current_picks"):
+    if not state.get("confirmed") or not any(state.get("current_picks", [])):
         return "No confirmed picks to rate", 200
 
-    picks = state["current_picks"]
-    state["feedback_mode"] = True
-    state["conversation_history"] = []  # fresh context for feedback
+    picks = [p for p in state["current_picks"] if p]
+    state["feedback_mode"]        = True
+    state["conversation_history"] = []
 
     prompt = (
         f"It's Tuesday evening. Ask Tushar and Sumegha to rate the 4 dishes "
         f"Chef Jag cooked on Monday. The dishes were: {picks}. "
-        f"Ask them to reply with thumbs up or down for each dish, numbered clearly."
+        f"Ask them to reply with 👍 or 👎 for each, numbered clearly."
     )
-
     reply = ask_claude(state, prompt, "System")
-    clean_reply, state = parse_reply(reply, state)
+    clean, state = parse_reply(reply, state)
     save_state(state)
-    broadcast(clean_reply)
+    broadcast(clean)
     return "OK", 200
 
 # ── Incoming WhatsApp ────────────────────────────────────────────────────────
@@ -387,9 +405,9 @@ def whatsapp_incoming():
 
     state = load_state()
     reply = ask_claude(state, body, sender_name)
-    clean_reply, state = parse_reply(reply, state)
+    clean, state = parse_reply(reply, state)
     save_state(state)
-    broadcast(clean_reply)
+    broadcast(clean)
     return str(MessagingResponse()), 200
 
 # ── Seed history ─────────────────────────────────────────────────────────────
@@ -397,13 +415,15 @@ def whatsapp_incoming():
 def seed_history():
     data  = request.get_json()
     state = load_state()
-    existing_weeks = {e["week"] for e in state["selection_history"]}
+    existing = {e["week"] for e in state["selection_history"]}
     added = 0
     for entry in data.get("history", []):
-        if entry["week"] not in existing_weeks:
+        if entry["week"] not in existing:
             state["selection_history"].append({
-                "week": entry["week"], "picks": entry["picks"],
-                "rejected": [], "feedback": {}
+                "week":     entry["week"],
+                "picks":    entry["picks"],
+                "rejected": [],
+                "feedback": {}
             })
             added += 1
     state["selection_history"].sort(key=lambda x: x["week"])
@@ -413,13 +433,16 @@ def seed_history():
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    state = load_state()
+    state   = load_state()
+    storage = "redis" if redis_client else "file (ephemeral — set UPSTASH_REDIS_URL)"
     return {
-        "status":   "ok",
-        "date":     date.today().isoformat(),
-        "history":  len(state.get("selection_history", [])),
-        "confirmed": state.get("confirmed", False),
-        "feedback_mode": state.get("feedback_mode", False)
+        "status":        "ok",
+        "storage":       storage,
+        "date":          date.today().isoformat(),
+        "history_weeks": len(state.get("selection_history", [])),
+        "confirmed":     state.get("confirmed", False),
+        "feedback_mode": state.get("feedback_mode", False),
+        "dish_scores":   len(state.get("dish_scores", {}))
     }, 200
 
 if __name__ == "__main__":
