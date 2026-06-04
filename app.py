@@ -433,6 +433,23 @@ def seed_history():
     save_state(state)
     return {"seeded": added, "total": len(state["selection_history"])}, 200
  
+# ── Reset rules ──────────────────────────────────────────────────────────────
+@app.route("/reset_rules", methods=["GET", "POST"])
+def reset_rules():
+    state = load_state()
+    state["rules"] = {
+        "slots": [
+            {"label": "Chicken dish",  "category": "Indian", "filter": "chicken"},
+            {"label": "Salad",         "category": "Salads", "filter": "any"},
+            {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
+            {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
+        ],
+        "no_repeat_weeks": 2,
+        "rule_overrides_this_week": []
+    }
+    save_state(state)
+    return {"status": "rules reset to default"}, 200
+ 
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
