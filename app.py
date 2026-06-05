@@ -44,7 +44,7 @@ DEFAULT_STATE = {
     "rules": {
         "slots": [
             {"label": "Chicken dish",  "category": "Indian", "filter": "chicken"},
-            {"label": "Salad",         "category": "Salads", "filter": "any"},
+            {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
             {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
             {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
         ],
@@ -322,11 +322,21 @@ def parse_reply(reply, state):
         try:
             block = reply.split("<<<RULE_CHANGE>>>")[1].split("<<<END>>>")[0].strip()
             data  = json.loads(block)
-            if data.get("new_slots"):
-                if data.get("type") == "permanent":
-                    state["rules"]["slots"] = data["new_slots"]
+            new_slots = data.get("new_slots")
+            # Validate slots are proper dicts before saving
+            if new_slots and isinstance(new_slots, list):
+                valid = all(
+                    isinstance(s, dict) and 
+                    "label" in s and "category" in s and "filter" in s
+                    for s in new_slots
+                )
+                if valid:
+                    if data.get("type") == "permanent":
+                        state["rules"]["slots"] = new_slots
+                    else:
+                        state["rules"]["rule_overrides_this_week"] = new_slots
                 else:
-                    state["rules"]["rule_overrides_this_week"] = data["new_slots"]
+                    print(f"Rule change ignored — invalid slot format: {new_slots}")
         except Exception as e:
             print(f"Rule change parse error: {e}")
         clean = reply.split("<<<RULE_CHANGE>>>")[0].strip()
@@ -440,7 +450,7 @@ def reset_rules():
     state["rules"] = {
         "slots": [
             {"label": "Chicken dish",  "category": "Indian", "filter": "chicken"},
-            {"label": "Salad",         "category": "Salads", "filter": "any"},
+            {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
             {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
             {"label": "Veg dish",      "category": "Indian", "filter": "vegetarian"},
         ],
