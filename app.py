@@ -344,12 +344,15 @@ def parse_reply(reply, state):
     return clean, state
  
 # ── Twilio helpers ───────────────────────────────────────────────────────────
-def send_whatsapp(message, to_number):
-    twilio_client.messages.create(from_=TWILIO_NUMBER, body=message, to=to_number)
+def send_sms(message, to_number):
+    # Strip whatsapp: prefix if present for SMS sending
+    from_num = TWILIO_NUMBER.replace("whatsapp:", "")
+    to_num   = to_number.replace("whatsapp:", "")
+    twilio_client.messages.create(from_=from_num, body=message, to=to_num)
  
 def broadcast(message):
-    send_whatsapp(message, USER_NUMBER)
-    send_whatsapp(message, SUMEGHA_NUMBER)
+    send_sms(message, USER_NUMBER)
+    send_sms(message, SUMEGHA_NUMBER)
  
 # ── Thursday trigger ─────────────────────────────────────────────────────────
 @app.route("/trigger", methods=["GET", "POST"])
